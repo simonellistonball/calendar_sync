@@ -2,5 +2,8 @@
 credentials.json
 token.json
 sync.log
+.sync.lock
+launchd-stdout.log
+launchd-stderr.log
 __pycache__/
 *.pyc

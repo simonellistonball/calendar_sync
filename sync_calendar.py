@@ -17,6 +17,7 @@ Designed to be run on a schedule (cron / Task Scheduler).
 After initial OAuth setup for the personal calendar, runs unattended.
 """
 
+import fcntl
 import hashlib
 import os
 import sys
@@ -39,6 +40,7 @@ from googleapiclient.errors import HttpError
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOG_FILE = SCRIPT_DIR / "sync.log"
+LOCK_FILE = SCRIPT_DIR / ".sync.lock"
 
 # Load .env file from the same directory as the script
 load_dotenv(SCRIPT_DIR / ".env")
@@ -49,6 +51,7 @@ load_dotenv(SCRIPT_DIR / ".env")
 CONFIG = {
     # Required (no defaults — must be set in .env)
     "ical_url": os.environ.get("ICAL_URL", ""),
+    "corporate_email": os.environ.get("CORPORATE_EMAIL", ""),
     "personal_calendar_id": os.environ.get("PERSONAL_CALENDAR_ID", "primary"),
 
     # Optional (defaults applied if not set in .env)
@@ -133,40 +136,104 @@ def fingerprint(start: datetime, end: datetime) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-def _is_real_meeting(component) -> bool:
+def _tz_name_from_tzinfo(tzinfo_obj) -> str:
+    """Extract an IANA timezone name from a tzinfo object, or return None."""
+    if tzinfo_obj is None:
+        return None
+    # zoneinfo.ZoneInfo uses .key
+    if hasattr(tzinfo_obj, "key"):
+        return tzinfo_obj.key
+    # pytz zones use .zone
+    if hasattr(tzinfo_obj, "zone"):
+        return tzinfo_obj.zone
+    # dateutil zones use ._name
+    name = getattr(tzinfo_obj, "_name", None)
+    if name:
+        return str(name)
+    return None
+
+
+def _format_block_time(block: dict) -> str:
     """
-    Returns True only if this VEVENT is a genuine meeting with other people.
+    Format a block's time range showing the source timezone and local equivalent.
+    Example: "Thu 03 Apr 14:00–15:00 (Europe/London) [15:00–16:00 CEST local]"
+    """
+    start = block["start"]
+    end = block["end"]
+    tz_label = block["start_tz"]
+
+    local_start = start.astimezone()
+    local_end = end.astimezone()
+    local_tz_name = local_start.strftime("%Z")
+
+    source_str = (
+        f"{start.strftime('%a %d %b %H:%M')}–{end.strftime('%H:%M')} ({tz_label})"
+    )
+
+    # Only append local conversion if the local timezone differs
+    if start.utcoffset() == local_start.utcoffset():
+        return source_str
+
+    local_str = (
+        f"{local_start.strftime('%H:%M')}–{local_end.strftime('%H:%M')} {local_tz_name} local"
+    )
+    return f"{source_str} [{local_str}]"
+
+
+def _is_real_meeting(component, owner_email: str = "") -> bool:
+    """
+    Returns True only if this VEVENT is a genuine meeting with other people
+    that the calendar owner has not declined.
 
     Detection logic:
       - Must not be cancelled.
       - Must have at least MIN_ATTENDEES attendee entries in the iCal data.
         Solo events (Focus Time, OOO, personal blocks) have zero attendees.
         Real meetings have 2+ (the organizer + invitees).
+      - If owner_email is set, the owner's ATTENDEE entry must not have
+        PARTSTAT=DECLINED.
     """
+    summary = component.get("SUMMARY", "(no title)")
+
     # Check status
     status = str(component.get("STATUS", "CONFIRMED")).upper()
     if status == "CANCELLED":
-        log.debug("Skipped cancelled: %s", component.get("SUMMARY", ""))
+        log.debug("Skipped cancelled: %s", summary)
         return False
 
-    # Count ATTENDEE properties
+    # Normalise attendee list
     # In icalendar, if there are multiple ATTENDEE lines, component.get()
     # returns a list. If there's one, it returns a single vCalAddress.
     # If there are none, it returns None.
     attendees = component.get("ATTENDEE")
     if attendees is None:
-        attendee_count = 0
+        attendee_list = []
     elif isinstance(attendees, list):
-        attendee_count = len(attendees)
+        attendee_list = attendees
     else:
-        attendee_count = 1
+        attendee_list = [attendees]
 
-    if attendee_count < MIN_ATTENDEES:
-        log.debug(
-            "Skipped (no attendees): %s",
-            component.get("SUMMARY", "(no title)"),
-        )
+    if len(attendee_list) < MIN_ATTENDEES:
+        log.debug("Skipped (no attendees): %s", summary)
         return False
+
+    # Check if the calendar owner has declined.
+    # Google Workspace iCal exports include PARTSTAT on each ATTENDEE, e.g.:
+    #   ATTENDEE;PARTSTAT=DECLINED;CN=user@example.com:mailto:user@example.com
+    if owner_email:
+        owner = owner_email.lower()
+        for attendee in attendee_list:
+            addr = str(attendee).lower().replace("mailto:", "")
+            if addr != owner:
+                continue
+            partstat = str(
+                attendee.params.get("PARTSTAT", "NEEDS-ACTION")
+                if hasattr(attendee, "params") else "NEEDS-ACTION"
+            ).upper()
+            if partstat == "DECLINED":
+                log.debug("Skipped (declined): %s", summary)
+                return False
+            break
 
     return True
 
@@ -174,10 +241,11 @@ def _is_real_meeting(component) -> bool:
 # ---------------------------------------------------------------------------
 # iCal parsing
 # ---------------------------------------------------------------------------
-def fetch_ical_events(ical_url: str, sync_days: int) -> list[dict]:
+def fetch_ical_events(ical_url: str, sync_days: int, owner_email: str = "") -> list[dict]:
     """
     Fetch and parse corporate calendar events from the iCal URL.
-    Returns only real meetings: timed events with attendees, not cancelled.
+    Returns only real meetings: timed events with attendees, not cancelled,
+    and not declined by the owner (if owner_email is set).
     Solo events (Focus Time, OOO, personal blocks) are excluded because
     they have no ATTENDEE entries in the iCal export.
     """
@@ -223,18 +291,23 @@ def fetch_ical_events(ical_url: str, sync_days: int) -> list[dict]:
             skipped_types["outside_window"] += 1
             continue
 
-        # Only sync real meetings (with attendees, not cancelled)
-        if not _is_real_meeting(component):
+        # Only sync real meetings (with attendees, not cancelled, not declined)
+        if not _is_real_meeting(component, owner_email):
             skipped_types["no_attendees"] += 1
             continue
 
-        # Extract timezone info
-        start_tz = "UTC"
-        end_tz = "UTC"
+        # Extract timezone info — prefer TZID param (IANA name), fall back
+        # to the tzinfo attached to the datetime by the icalendar library.
+        start_tz = None
+        end_tz = None
         if hasattr(dtstart, "params") and "TZID" in dtstart.params:
             start_tz = str(dtstart.params["TZID"])
+        if not start_tz:
+            start_tz = _tz_name_from_tzinfo(start.tzinfo) or "UTC"
         if hasattr(dtend, "params") and "TZID" in dtend.params:
             end_tz = str(dtend.params["TZID"])
+        if not end_tz:
+            end_tz = _tz_name_from_tzinfo(end.tzinfo) or "UTC"
 
         events.append({
             "start": start,
@@ -406,10 +479,9 @@ def reconcile(
         if fp not in existing_fps:
             if config["dry_run"]:
                 log.info(
-                    "[DRY RUN] Would create: %s  %s → %s",
+                    "[DRY RUN] Would create: %s  %s",
                     config["block_title"],
-                    block["start"].strftime("%a %d %b %H:%M"),
-                    block["end"].strftime("%H:%M"),
+                    _format_block_time(block),
                 )
             else:
                 event_body = {
@@ -438,10 +510,9 @@ def reconcile(
 
                 service.events().insert(calendarId=cal_id, body=event_body).execute()
                 log.info(
-                    "Created: %s  %s → %s",
+                    "Created: %s  %s",
                     config["block_title"],
-                    block["start"].strftime("%a %d %b %H:%M"),
-                    block["end"].strftime("%H:%M"),
+                    _format_block_time(block),
                 )
             stats["created"] += 1
         else:
@@ -490,7 +561,7 @@ def main():
 
     # --- Step 1: Fetch corporate events via iCal ---
     try:
-        raw_events = fetch_ical_events(CONFIG["ical_url"], CONFIG["sync_days"])
+        raw_events = fetch_ical_events(CONFIG["ical_url"], CONFIG["sync_days"], CONFIG["corporate_email"])
     except requests.RequestException as e:
         log.error("Failed to fetch iCal feed: %s", e)
         sys.exit(1)
@@ -523,4 +594,14 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    lock_fp = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log.info("Another instance is already running — exiting.")
+        sys.exit(0)
+    try:
+        main()
+    finally:
+        fcntl.flock(lock_fp, fcntl.LOCK_UN)
+        lock_fp.close()
