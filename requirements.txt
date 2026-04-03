@@ -4,3 +4,4 @@ google-auth-oauthlib>=1.1.0
 icalendar>=5.0.0
 python-dotenv>=1.0.0
 requests>=2.31.0
+pyobjc-framework-EventKit>=10.0  # macOS only — for sync_icloud.py
