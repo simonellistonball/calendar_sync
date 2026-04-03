@@ -259,13 +259,22 @@ def fetch_eventkit_events(store, calendar, sync_days: int) -> list[dict]:
             tz_name = cal_tz.name() if cal_tz else "UTC"
 
         if all_day:
-            # For all-day events, store as date objects
+            # For all-day events, convert from UTC to the event's local
+            # timezone before extracting the date.  Without this, timezones
+            # east of UTC shift midnight backwards into the previous day
+            # (e.g. 2026-04-03 00:00 BST → 2026-04-02 23:00 UTC → April 2).
+            try:
+                local_tz = ZoneInfo(tz_name)
+            except (KeyError, Exception):
+                local_tz = timezone.utc
+            local_start = start_dt.astimezone(local_tz)
+            local_end = end_dt.astimezone(local_tz)
             events.append({
                 "summary": summary,
                 "description": description,
                 "location": location,
-                "start": start_dt.date(),
-                "end": end_dt.date(),
+                "start": local_start.date(),
+                "end": local_end.date(),
                 "all_day": True,
                 "start_tz": None,
                 "end_tz": None,
